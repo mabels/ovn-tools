@@ -1,0 +1,4 @@
+# Install as: /etc/dhcpcd.exit-hook
+# dhcpcd sources this directly, same caveat as the dhclient shim — keep
+# POSIX sh only here.
+python3 /usr/local/bin/ovn_uplink_sync.py dhcpcd
