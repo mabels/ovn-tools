@@ -1,0 +1,8 @@
+{
+  "dhcp-probe-1280": {
+    "router": "router-uplink",
+    "port": "lrp-uplink-1280-dhcp",
+    "mac": "00:00:c0:a8:84:51",
+    "backbone_subnet": "10.80.0.0/16"
+  }
+}
