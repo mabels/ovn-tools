@@ -1,0 +1,14 @@
+[Unit]
+Description=OVN uplink sync — %i (DHCP-driven OVN router port/SNAT/route updater)
+After=network-pre.target ovn-setup.service
+Wants=ovn-setup.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/ovn_uplink_sync.py install %i
+ExecStart=/usr/local/bin/ovn_uplink_sync.py run %i
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
