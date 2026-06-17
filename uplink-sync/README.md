@@ -1,91 +1,109 @@
 # uplink-sync
 
+Keeps an OVN logical router port — plus its SNAT rule and default route —
+in sync with a dynamically-leased DHCPv4 address on a real interface.
+
+## Why
+
+OVN logical router ports take a *static* IP/subnet. There's no built-in way
+for one to track a dynamically-leased WAN address (cable modem, DSL,
+LTE/Starlink uplink, etc.) the way a normal Linux interface does via
+`dhclient`/`dhcpcd`/`systemd-networkd`.
+
+## How it works
+
+The real DHCP client (`dhclient`, currently) runs directly on the uplink's
+interface — which is also an OVS bridge member feeding an OVN-mapped
+provider bridge. The DHCP client doesn't need to know anything about OVN;
+it behaves exactly as it always would. On every lease event
+(BOUND/RENEW/EXPIRE/...), its exit-hook calls back into
+`ovn_uplink_sync.py`, which:
+
+- updates the configured OVN logical router port's `networks` to match
+  the current lease IP/prefix (`ovn-nbctl set logical_router_port ...`)
+- replaces the SNAT external address so internal traffic keeps
+  translating correctly when the lease changes (`ovn-nbctl lr-nat-add/del
+  ... snat ...`)
+- replaces the default route to point at the lease's gateway
+  (`ovn-nbctl lr-route-add/del ... 0.0.0.0/0 ...`)
+
+Updates are skipped entirely if the lease's IP hasn't actually changed, so
+routine renewals are no-ops rather than flapping NAT/conntrack state.
+
+The script owns its own lifecycle: it installs its own dhclient hook file
+(idempotently, safe to call repeatedly) and is itself what systemd
+supervises — `run <uplink>` execs the configured DHCP client in the
+foreground, so systemd ends up supervising the real client process
+directly (journal capture, `Restart=`, etc. all work normally).
+
+This deliberately does **not** use `systemd-networkd` for the uplink
+interface — networkd insists on trying (and failing, loudly but
+non-fatally) to set itself as the interface's netlink master alongside
+OVS, and in practice this leaves the interface stuck in `enslaved
+(configuring)` rather than ever reaching a state where DHCP completes
+cleanly. Running `dhclient` directly, supervised by its own systemd unit,
+sidesteps that entirely. See the project history / commit log for the
+debugging trail if you hit the same issue.
+
 ## Files
 
-- `ovn_uplink_sync.py` — the actual tool. Single file, Python 3 stdlib
-  only. Install to `/usr/local/bin/ovn_uplink_sync.py`.
-- `mapping.example.json` — copy to `/etc/ovn-uplink-sync/mapping.json` and
+- `ovn_uplink_sync.py` — the tool. Single file, Python 3 stdlib only.
+  Install to `/usr/local/bin/ovn_uplink_sync.py`.
+- `uplinks.example.json` — copy to `/etc/ovn-uplink-sync/uplinks.json` and
   edit for your topology.
-- `hooks/` — thin per-client shims. Each one's filename documents where it
-  needs to be installed; install only the ones for the DHCP client(s) you
-  actually use.
+- `systemd/ovn-uplink-sync@.service` — template unit. Install to
+  `/etc/systemd/system/ovn-uplink-sync@.service`.
+- `hooks/dhcpcd.exit-hook`,
+  `hooks/networkd-dispatcher-50-ovn-uplink-sync.sh` — manual-install hook
+  templates for dhcpcd/networkd-dispatcher. The `dhclient` adapter is
+  self-installing via `ovn_uplink_sync.py install`; these other two
+  clients aren't wired into `install`/`run` yet (see Known limitations),
+  so install them by hand if you need them today.
 
-## Prerequisites
-
-This tool assumes you already have an OVN bridge dedicated to the dynamic
-uplink (same one-bridge-per-segment pattern used for any OVN provider
-network), and that you've created an OVS *internal* port inside that bridge
-for the DHCP client to run against, isolated in its own network namespace
-so it can't collide with anything else on the host's default namespace:
-
-```sh
-ovs-vsctl add-port br-uplink-dyn dhcp-probe-X \
-  -- set interface dhcp-probe-X type=internal
-
-ip netns add ns-dhcp-X
-ip link set dhcp-probe-X netns ns-dhcp-X
-ip netns exec ns-dhcp-X ip link set lo up
-ip netns exec ns-dhcp-X ip link set dhcp-probe-X up
-```
-
-`ovn-nbctl` talks to the OVSDB northbound socket over a Unix domain socket
-path, which is visible from inside the network namespace (network
-namespaces don't isolate the filesystem/mount namespace), so the hook
-script can call `ovn-nbctl` directly from inside `ns-dhcp-X` with no extra
-plumbing.
-
-## mapping.json format
+## uplinks.json format
 
 ```json
 {
-  "<dhcp-client-interface-name>": {
+  "<name>": {
+    "interface": "<real interface name the DHCP client runs against>",
     "router": "<OVN logical router name>",
     "port": "<OVN logical router port name to keep in sync>",
     "mac": "<MAC to assign if the port doesn't exist yet>",
-    "backbone_subnet": "<subnet to SNAT toward this uplink, e.g. 10.80.0.0/16>"
+    "backbone_subnet": "<subnet to SNAT toward this uplink, e.g. 10.80.0.0/16>",
+    "client": "dhclient"
   }
 }
 ```
 
-One entry per dynamic uplink. The key must match the interface name the
-DHCP client sees (e.g. `dhcp-probe-1280`), not the underlying VLAN/physical
-interface name.
+`<name>` is also the systemd template instance name — e.g. an entry keyed
+`"1280"` is brought up with `systemctl enable --now
+ovn-uplink-sync@1280.service`.
 
-## Installing the dhclient hook
-
-```sh
-mkdir -p /etc/dhcp/dhclient-exit-hooks.d
-cp hooks/dhclient-exit-hooks.d-ovn-uplink-sync \
-   /etc/dhcp/dhclient-exit-hooks.d/ovn-uplink-sync
-chmod +x /etc/dhcp/dhclient-exit-hooks.d/ovn-uplink-sync
-```
-
-Then run dhclient inside the namespace against the probe interface:
+## Installing
 
 ```sh
-ip netns exec ns-dhcp-X dhclient -v dhcp-probe-X
+cp ovn_uplink_sync.py /usr/local/bin/ovn_uplink_sync.py
+chmod +x /usr/local/bin/ovn_uplink_sync.py
+
+mkdir -p /etc/ovn-uplink-sync
+cp uplinks.example.json /etc/ovn-uplink-sync/uplinks.json
+# edit to match your topology
+
+cp systemd/ovn-uplink-sync@.service /etc/systemd/system/
+systemctl daemon-reload
 ```
 
-## Installing the dhcpcd hook
+## Bringing up an uplink
 
 ```sh
-cp hooks/dhcpcd.exit-hook /etc/dhcpcd.exit-hook
-chmod +x /etc/dhcpcd.exit-hook
+systemctl enable --now ovn-uplink-sync@<name>.service
 ```
 
-## Installing the networkd-dispatcher hook
-
-Requires [`networkd-dispatcher`](https://github.com/wertarbyte/networkd-dispatcher)
-installed separately.
-
-```sh
-cp hooks/networkd-dispatcher-50-ovn-uplink-sync.sh \
-   /etc/networkd-dispatcher/configured.d/50-ovn-uplink-sync
-chmod +x /etc/networkd-dispatcher/configured.d/50-ovn-uplink-sync
-```
-
-Copy/symlink into `routable.d/`, `off.d/`, etc. as needed for the state
-transitions you want to react to.
+That's the entire deployment step for a new uplink once it has an entry in
+`uplinks.json` — no separate per-interface unit file to write by hand.
+`ExecStartPre` calls `install <name>` (idempotent — installs the dhclient
+hook if it isn't already in place), then `ExecStart` calls `run <name>`,
+which execs `dhclient` directly so systemd supervises it.
 
 ## Manual / testing
 
@@ -100,19 +118,24 @@ for testing the OVN-side logic without a live DHCP transaction.
 
 ```sh
 OVN_UPLINK_SYNC_DEBUG=1 python3 ovn_uplink_sync.py apply ...
+journalctl -u ovn-uplink-sync@<name>.service -f
 ```
 
-Enables debug-level logging, including every `ovn-nbctl` invocation.
+`OVN_UPLINK_SYNC_DEBUG=1` enables debug-level logging, including every
+`ovn-nbctl` invocation.
 
 ## Known limitations
 
-- IPv4 only. IPv6/SLAAC support is planned but not implemented — OVN router
-  ports have no equivalent "client" concept for SLAAC the way they at least
-  conceptually map onto a DHCPv4 lease, so this will likely need its own
-  netns-based watcher rather than reusing the DHCP adapter pattern.
-- The `networkd` adapter's JSON parsing is based on documented
-  `networkctl status --json` output but has not yet been exercised against
-  a real lease in this repo's testing — treat it as less proven than the
-  `dhclient` and `dhcpcd` adapters.
-- No automated tests yet (would need a fake `ovn-nbctl` on PATH to test the
-  apply logic without a live OVN instance).
+- IPv4 only. IPv6/SLAAC support is planned but not implemented — OVN
+  router ports have no equivalent "client" concept for SLAAC the way they
+  at least conceptually map onto a DHCPv4 lease, so this will likely need
+  its own netns-based watcher rather than reusing the DHCP adapter
+  pattern.
+- Only `dhclient` is wired into `install`/`run` (`CLIENT_COMMANDS`).
+  `dhcpcd` and `networkd-dispatcher` have working adapter functions
+  (`adapter_dhcpcd`, and the `dhclient`/`dhcpcd` CLI subcommands) but
+  aren't yet supervised the same way — install their hook templates from
+  `hooks/` by hand and run the client yourself if you need one of those
+  today.
+- No automated tests yet (would need a fake `ovn-nbctl` on PATH to test
+  the apply logic without a live OVN instance).
