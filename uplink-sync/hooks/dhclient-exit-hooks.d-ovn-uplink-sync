@@ -1,0 +1,4 @@
+# Install as: /etc/dhcp/dhclient-exit-hooks.d/ovn-uplink-sync
+# dhclient-script sources this with dash's ".", not bash — keep this file
+# POSIX sh only. All real logic lives in ovn_uplink_sync.py.
+python3 /usr/local/bin/ovn_uplink_sync.py dhclient
